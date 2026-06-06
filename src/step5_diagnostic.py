@@ -301,6 +301,9 @@ def main():
                     metavar="NAME=PATH",
                     help="repeatable, e.g. --pred RoBERTa=outputs/preds/x.json")
     ap.add_argument("--outdir", required=True)
+    ap.add_argument("--require", action="append", default=[],
+                    help="model name(s) that MUST be present; error if missing. "
+                         "By default missing prediction files are skipped.")
     args = ap.parse_args()
 
     models = {}
@@ -309,6 +312,27 @@ def main():
             raise SystemExit(f"--pred must be NAME=PATH, got {spec!r}")
         name, path = spec.split("=", 1)
         models[name] = path
+
+    # Tolerate not-yet-produced prediction files (e.g. ARG before you've trained
+    # and dumped it). Skip them with a warning instead of crashing.
+    present, missing = {}, []
+    for name, path in models.items():
+        if os.path.exists(path):
+            present[name] = path
+        else:
+            missing.append((name, path))
+    for name, path in missing:
+        if name in args.require:
+            raise SystemExit(f"[diag] required model {name!r} missing: {path}")
+        print(f"[diag] SKIP {name!r}: prediction file not found ({path})")
+    if len(present) < 2:
+        raise SystemExit(
+            f"[diag] need >=2 models to compare, found {len(present)} "
+            f"({list(present)}). Produce more prediction files first — e.g. ARG "
+            "via src/arg_integration/README.md.")
+    if missing:
+        print(f"[diag] running on {len(present)} models: {list(present)}")
+    models = present
 
     os.makedirs(args.outdir, exist_ok=True)
     (summary, names, acc, pair_jaccard, pair_oracle,

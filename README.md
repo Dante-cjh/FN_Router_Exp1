@@ -66,9 +66,26 @@ data/zh/{train,val,test}.json     Weibo21   : 5203 / 1951 / 1951
 Each item carries the complete ARG schema —
 `content, label, source_id (numeric), td_rationale, cs_rationale, td_pred,
 cs_pred, td_acc, cs_acc` — so it loads directly in both the official ARG repo
-and this pipeline. The rationales are the shipped **GPT-3.5** ones; **step1 is
-skipped** and ARG is trained on them as-is. (GPT-5.4 is still the large-model
-*direct* judge in step2.)
+and this pipeline.
+
+**Advisor = GPT-5.4.** The data ships GPT-3.5 rationales, but **step1
+regenerates them in-place with GPT-5.4** so all three diagnostic legs share the
+same large model (ARG advisor + step2 direct judge). step1 overwrites only the
+six fields `td_rationale, cs_rationale, td_pred, cs_pred, td_acc, cs_acc`
+(everything else preserved), makes a one-time `*.bak` backup, and is resumable
+via its cache. It runs automatically as step 1 of `scripts/run_*.sh`; to do it
+manually:
+
+```bash
+for s in train val test; do
+  python -m src.step1_generate_rationales \
+    --input data/zh/$s.json --in_place \
+    --cache outputs/cache/zh_${s}_rat.jsonl --language zh
+done   # ~18k calls for zh, ~13k for en; restartable any time
+```
+
+Train ARG **after** step1 so its advisor is GPT-5.4. To revert to the shipped
+GPT-3.5 rationales, restore the `*.bak` files.
 
 > `src/prepare_data.py` is a **fallback only** — for rebuilding splits from raw
 > sources (Weibo21 `.pkl`, FakeNewsNet GossipCop CSVs) when the official ARG

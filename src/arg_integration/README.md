@@ -22,15 +22,22 @@ ARG README; once approved you receive `train/val/test.json`.
 > "small + LLM advisor" system, which is the leg that matters for the routing
 > argument; its internal backbone choice does not change the diagnostic.
 
-## Rationales
+## Rationales = GPT-5.4 advisor
 
-We use the **shipped GPT-3.5 rationales** as-is (step1 is skipped). The official
-ARG data already lives at `Router_Exp1/data/en` and `Router_Exp1/data/zh` with
-all rationale fields, so point ARG's `--root_path` straight at those folders.
+Run **step1 first** to overwrite the shipped GPT-3.5 rationales with GPT-5.4 ones
+(in-place in `Router_Exp1/data/en` and `data/zh`), so ARG's advisor matches the
+step2 large model:
 
-> If you later decide you want a GPT-5.4 advisor instead, run
-> `python -m src.step1_generate_rationales` to overwrite the
-> `td_*/cs_*` fields, then retrain. Not needed for the current setup.
+```bash
+# from Router_Exp1/
+for s in train val test; do
+  python -m src.step1_generate_rationales --input data/en/$s.json --in_place \
+    --cache outputs/cache/en_${s}_rat.jsonl --language en
+done
+```
+
+This touches only `td_*/cs_*` and keeps a `*.bak` backup. Then point ARG's
+`--root_path` straight at `Router_Exp1/data/en` (or `data/zh`).
 
 ## Train ARG
 

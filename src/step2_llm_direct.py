@@ -49,7 +49,6 @@ async def _query(client, language, item_id, gold, content, cache_path):
 
 async def run(args):
     data = load_json(args.input)
-    client = LLMClient()
 
     cache = {str(r["id"]): r for r in load_jsonl(args.cache)}
 
@@ -65,6 +64,7 @@ async def run(args):
           f"({len(cache)} cached).")
 
     if todo:
+        client = LLMClient()  # constructed only when there's work to do
         coros = [_query(client, args.language, iid, gold, content, args.cache)
                  for (iid, gold, content) in todo]
         results = await gather_bounded(coros, desc="direct judge")
