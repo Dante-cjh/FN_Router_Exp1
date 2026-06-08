@@ -11,16 +11,26 @@ For each model we have a unified prediction file:
 
 Metrics produced
 ----------------
-* Per model: accuracy, macro-F1.
+* Per model: accuracy AND macro-F1.
 * Pairwise error Jaccard: |E_i ∩ E_j| / |E_i ∪ E_j|  (1 = identical mistakes,
   0 = disjoint mistakes -> maximal routing headroom).
-* Oracle router upper bound: accuracy of a perfect router that, per sample,
-  picks any model that is correct = fraction of samples where >=1 model is right.
-  Computed for every pair and for the full set.
-* Routing gain = oracle - best single-model accuracy.
+* Oracle router upper bound, reported in BOTH metrics:
+    - oracle accuracy = fraction of samples where >=1 model is right.
+    - oracle macro-F1 = macro-F1 of the oracle's per-sample predictions, where
+      the oracle outputs the gold label whenever some model is correct and the
+      flipped label otherwise. This makes the oracle "at least one correct"
+      accounting *per class*, so a majority-class consensus can no longer inflate
+      the headroom on imbalanced datasets (e.g. GossipCop).
+* Routing headroom = oracle - best single model, in BOTH metrics.
 
-Verdict rule (from the project brief)
--------------------------------------
+PRIMARY metric = macro-F1.
+On imbalanced data (GossipCop: real ≫ fake) accuracy is dominated by the
+majority class, so both the per-model numbers and the "≥1 correct" oracle look
+inflated. The verdict below is therefore driven by the **macro-F1** headroom;
+the accuracy headroom is reported alongside it for reference only.
+
+Verdict rule (from the project brief, applied to macro-F1)
+----------------------------------------------------------
     gain >= 5.0 pts  -> routing direction is well-founded
     gain <  1.0 pts  -> pivot
     otherwise        -> weak / inconclusive
@@ -49,9 +59,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+from sklearn.metrics import f1_score  # noqa: E402
 
-def load_pred_file(path: str) -> Dict[str, int]:
-    """Return {str(id): correct(0/1)} plus the raw label/pred maps."""
+
+def load_pred_file(path: str):
+    """Return ({str(id): gold}, {str(id): pred})."""
     with open(path, "r", encoding="utf-8") as f:
         rows = json.load(f)
     label_map, pred_map = {}, {}
@@ -62,8 +74,15 @@ def load_pred_file(path: str) -> Dict[str, int]:
     return label_map, pred_map
 
 
-def align(models: Dict[str, str]):
-    """Load all models, intersect ids, return ids, labels, and correctness."""
+def align(models: Dict[str, str], strict_split: bool = False):
+    """Load all models, intersect ids, return ids, labels, preds, correctness.
+
+    If ``strict_split`` is set, disagreeing gold labels across files on the same
+    id are a hard error rather than a warning. Disagreement is the fingerprint of
+    two different test splits being joined (e.g. an official-ARG 1258 test paired
+    with a RoBERTa run trained on the rebuilt prepare_data split), so for a
+    publishable diagnostic you want this to fail loudly.
+    """
     labels_per, preds_per = {}, {}
     for name, path in models.items():
         lm, pm = load_pred_file(path)
@@ -86,115 +105,181 @@ def align(models: Dict[str, str]):
         if len(gold_vals) > 1:
             mismatches += 1
     if mismatches:
-        print(f"[diag] WARNING: {mismatches} ids have disagreeing gold labels "
-              "across files (check you used the same test split).")
+        msg = (f"{mismatches} ids have disagreeing gold labels across files "
+               "-- the prediction files almost certainly come from DIFFERENT "
+               "test splits (check that RoBERTa was trained/evaluated on the "
+               "same official ARG split that produced the GPT-5.4 preds).")
+        if strict_split:
+            raise SystemExit(f"[diag] FATAL: {msg}")
+        print(f"[diag] WARNING: {msg}")
+    else:
+        print(f"[diag] split check OK: gold labels agree on all "
+              f"{len(ids)} common ids.")
 
     labels = np.array([ref[i] for i in ids], dtype=int)
-    correct = {}  # name -> bool array (pred == gold)
+    raw_preds, correct = {}, {}
     for n in models:
-        correct[n] = np.array([preds_per[n][i] == labels_per[n][i] for i in ids],
-                              dtype=bool)
-    return ids, labels, correct, sizes
+        raw_preds[n] = np.array([preds_per[n][i] for i in ids], dtype=int)
+        correct[n] = raw_preds[n] == labels
+    return ids, labels, raw_preds, correct, sizes
 
 
-def macro_f1(correct_unused, labels, preds):
-    from sklearn.metrics import f1_score
-    return f1_score(labels, preds, average="macro")
+def macro_f1(labels: np.ndarray, preds: np.ndarray) -> float:
+    return float(f1_score(labels, preds, average="macro"))
 
 
-def compute(models: Dict[str, str]):
-    ids, labels, correct, sizes = align(models)
+def oracle_predictions(labels: np.ndarray, correct_list: List[np.ndarray]):
+    """Per-sample oracle: output gold where any model is correct, else flip.
+
+    Returns (oracle_preds, any_correct). Binary {0,1} assumed (real=0, fake=1).
+    Computing macro-F1 on these predictions yields a *per-class* oracle ceiling:
+    a sample where everyone misses the minority (fake) class stays a fake-class
+    error, so a majority-class consensus cannot launder the headroom.
+    """
+    any_correct = np.zeros(len(labels), dtype=bool)
+    for c in correct_list:
+        any_correct = np.logical_or(any_correct, c)
+    preds = np.where(any_correct, labels, 1 - labels)
+    return preds, any_correct
+
+
+def compute(models: Dict[str, str], strict_split: bool = False):
+    ids, labels, raw_preds, correct, sizes = align(models, strict_split)
     names = list(models.keys())
     n = len(ids)
 
-    # Per-model accuracy + macro-F1 (rebuild preds from correctness+labels).
+    # Per-model accuracy + macro-F1.
     acc, f1 = {}, {}
-    # We need raw preds for F1; reload to keep it simple.
-    raw_preds = {}
-    for name, path in models.items():
-        _, pm = load_pred_file(path)
-        raw_preds[name] = np.array([pm[i] for i in ids], dtype=int)
-    from sklearn.metrics import f1_score
     for name in names:
         acc[name] = float(correct[name].mean())
-        f1[name] = float(f1_score(labels, raw_preds[name], average="macro"))
+        f1[name] = macro_f1(labels, raw_preds[name])
 
-    best_single = max(acc, key=acc.get)
-    best_single_acc = acc[best_single]
+    # PRIMARY ranking is by macro-F1; accuracy kept for reference.
+    best_single_f1_model = max(f1, key=f1.get)
+    best_single_f1 = f1[best_single_f1_model]
+    best_single_acc_model = max(acc, key=acc.get)
+    best_single_acc = acc[best_single_acc_model]
 
-    # Pairwise error Jaccard + pairwise oracle.
-    pair_jaccard, pair_oracle, pair_breakdown = {}, {}, {}
+    # Pairwise: error Jaccard + oracle (acc & macro-F1) + breakdown.
+    pair_jaccard, pair_oracle_acc, pair_oracle_f1, pair_breakdown = {}, {}, {}, {}
     for a, b in itertools.combinations(names, 2):
-        Ea = ~correct[a]
-        Eb = ~correct[b]
+        Ea, Eb = ~correct[a], ~correct[b]
         inter = np.logical_and(Ea, Eb).sum()
         union = np.logical_or(Ea, Eb).sum()
         pair_jaccard[(a, b)] = float(inter / union) if union else 0.0
-        oracle = float(np.logical_or(correct[a], correct[b]).mean())
-        pair_oracle[(a, b)] = oracle
+
+        o_preds, any_c = oracle_predictions(labels, [correct[a], correct[b]])
+        o_acc = float(any_c.mean())
+        o_f1 = macro_f1(labels, o_preds)
+        pair_oracle_acc[(a, b)] = o_acc
+        pair_oracle_f1[(a, b)] = o_f1
+
+        pair_best_acc = max(acc[a], acc[b])
+        pair_best_f1 = max(f1[a], f1[b])
         pair_breakdown[(a, b)] = {
             "both_correct": int(np.logical_and(correct[a], correct[b]).sum()),
             f"only_{a}": int(np.logical_and(correct[a], ~correct[b]).sum()),
             f"only_{b}": int(np.logical_and(~correct[a], correct[b]).sum()),
             "both_wrong": int(np.logical_and(~correct[a], ~correct[b]).sum()),
-            "pair_best_single_acc": float(max(acc[a], acc[b])),
-            "oracle_gain_pts": (oracle - max(acc[a], acc[b])) * 100,
+            "pair_best_single_acc": pair_best_acc,
+            "pair_best_single_f1": pair_best_f1,
+            "oracle_acc_gain_pts": (o_acc - pair_best_acc) * 100,
+            "oracle_f1_gain_pts": (o_f1 - pair_best_f1) * 100,
         }
 
-    # Full oracle (any model correct).
-    any_correct = np.zeros(n, dtype=bool)
-    for name in names:
-        any_correct |= correct[name]
-    full_oracle = float(any_correct.mean())
-    full_gain_pts = (full_oracle - best_single_acc) * 100
+    # Full oracle over all models, both metrics.
+    o_preds_full, any_correct = oracle_predictions(
+        labels, [correct[name] for name in names])
+    full_oracle_acc = float(any_correct.mean())
+    full_oracle_f1 = macro_f1(labels, o_preds_full)
+    full_gain_acc_pts = (full_oracle_acc - best_single_acc) * 100
+    full_gain_f1_pts = (full_oracle_f1 - best_single_f1) * 100
 
-    # Verdict per project rule.
-    if full_gain_pts >= 5.0:
-        verdict = "FOUNDED — routing direction has a learning-theoretic basis (gain ≥ 5 pts)."
-    elif full_gain_pts < 1.0:
-        verdict = "PIVOT — complementarity is negligible (gain < 1 pt)."
+    # Verdict on the PRIMARY (macro-F1) headroom.
+    g = full_gain_f1_pts
+    if g >= 5.0:
+        verdict = ("FOUNDED — routing direction has a learning-theoretic basis "
+                   "(macro-F1 gain ≥ 5 pts).")
+    elif g < 1.0:
+        verdict = ("PIVOT — complementarity is negligible in macro-F1 "
+                   "(gain < 1 pt).")
     else:
-        verdict = "WEAK — gain in the 1–5 pt grey zone; routing is plausible but not compelling."
+        verdict = ("WEAK — macro-F1 gain in the 1–5 pt grey zone; routing is "
+                   "plausible but not compelling.")
 
     summary = {
         "n_test": n,
         "models": names,
         "per_model_sizes": sizes,
+        "primary_metric": "macro_f1",
+        "label_balance": {
+            "n_real_0": int((labels == 0).sum()),
+            "n_fake_1": int((labels == 1).sum()),
+            "fake_ratio": float((labels == 1).mean()),
+        },
         "accuracy": acc,
         "macro_f1": f1,
-        "best_single_model": best_single,
+        "best_single_model": best_single_f1_model,       # by macro-F1 (primary)
+        "best_single_f1": best_single_f1,
+        "best_single_acc_model": best_single_acc_model,
         "best_single_acc": best_single_acc,
         "pair_error_jaccard": {f"{a}|{b}": v for (a, b), v in pair_jaccard.items()},
-        "pair_oracle_acc": {f"{a}|{b}": v for (a, b), v in pair_oracle.items()},
+        "pair_oracle_acc": {f"{a}|{b}": v for (a, b), v in pair_oracle_acc.items()},
+        "pair_oracle_f1": {f"{a}|{b}": v for (a, b), v in pair_oracle_f1.items()},
         "pair_breakdown": {f"{a}|{b}": v for (a, b), v in pair_breakdown.items()},
-        "full_oracle_acc": full_oracle,
-        "full_oracle_gain_pts": full_gain_pts,
+        "full_oracle_acc": full_oracle_acc,
+        "full_oracle_f1": full_oracle_f1,
+        "full_oracle_gain_acc_pts": full_gain_acc_pts,
+        "full_oracle_gain_f1_pts": full_gain_f1_pts,
+        # primary headroom alias (macro-F1)
+        "full_oracle_gain_pts": full_gain_f1_pts,
         "verdict": verdict,
     }
-    return summary, names, acc, pair_jaccard, pair_oracle, full_oracle, best_single_acc
+    return (summary, names, acc, f1, pair_jaccard, pair_oracle_acc,
+            pair_oracle_f1, pair_breakdown, full_oracle_acc, full_oracle_f1,
+            best_single_acc, best_single_f1)
 
 
 # --------------------------------------------------------------------------- #
 # Plotting
 # --------------------------------------------------------------------------- #
-def plot_accuracy_bars(names, acc, pair_oracle, full_oracle, best_single_acc,
-                       dataset, path):
-    labels = list(names) + [f"oracle:{a}+{b}" for (a, b) in pair_oracle] + ["oracle:ALL"]
-    vals = [acc[n] for n in names] + [pair_oracle[k] for k in pair_oracle] + [full_oracle]
-    colors = ["#4C78A8"] * len(names) + ["#F58518"] * len(pair_oracle) + ["#54A24B"]
-    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.1), 4.5))
-    bars = ax.bar(range(len(labels)), vals, color=colors)
-    ax.axhline(best_single_acc, ls="--", color="grey",
-               label=f"best single = {best_single_acc:.3f}")
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel("Test accuracy")
-    ax.set_ylim(min(vals) - 0.05, 1.02)
-    ax.set_title(f"{dataset}: single models vs oracle routers")
-    for b, v in zip(bars, vals):
-        ax.text(b.get_x() + b.get_width() / 2, v + 0.005, f"{v:.3f}",
-                ha="center", va="bottom", fontsize=8)
-    ax.legend()
+def plot_metric_bars(names, acc, f1, pair_oracle_acc, pair_oracle_f1,
+                     full_oracle_acc, full_oracle_f1, best_single_acc,
+                     best_single_f1, dataset, path):
+    """Grouped acc vs macro-F1 bars: single models + pair oracles + full oracle.
+
+    The acc–F1 gap on each bar is the visual tell for majority-class inflation:
+    where the orange (macro-F1) bar sits far below the blue (accuracy) bar, the
+    model — or the oracle — is mostly riding the majority class.
+    """
+    cats = list(names) + [f"oracle:{a}+{b}" for (a, b) in pair_oracle_acc] \
+        + ["oracle:ALL"]
+    acc_vals = [acc[n] for n in names] \
+        + [pair_oracle_acc[k] for k in pair_oracle_acc] + [full_oracle_acc]
+    f1_vals = [f1[n] for n in names] \
+        + [pair_oracle_f1[k] for k in pair_oracle_f1] + [full_oracle_f1]
+
+    x = np.arange(len(cats))
+    w = 0.38
+    fig, ax = plt.subplots(figsize=(max(7, len(cats) * 1.25), 4.8))
+    b1 = ax.bar(x - w / 2, acc_vals, w, label="accuracy", color="#4C78A8")
+    b2 = ax.bar(x + w / 2, f1_vals, w, label="macro-F1 (primary)",
+                color="#F58518")
+    ax.axhline(best_single_acc, ls=":", color="#4C78A8", lw=1.2,
+               label=f"best single acc = {best_single_acc:.3f}")
+    ax.axhline(best_single_f1, ls="--", color="#F58518", lw=1.4,
+               label=f"best single F1 = {best_single_f1:.3f}")
+    ax.set_xticks(x)
+    ax.set_xticklabels(cats, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("score")
+    ax.set_ylim(min(min(acc_vals), min(f1_vals)) - 0.06, 1.03)
+    ax.set_title(f"{dataset}: single models vs oracle routers "
+                 f"(accuracy vs macro-F1)")
+    for bars, vals in ((b1, acc_vals), (b2, f1_vals)):
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, v + 0.005, f"{v:.3f}",
+                    ha="center", va="bottom", fontsize=7.5)
+    ax.legend(fontsize=8, loc="lower left")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -225,6 +310,62 @@ def plot_jaccard_heatmap(names, pair_jaccard, dataset, path):
     plt.close(fig)
 
 
+def plot_complementarity(pair_breakdown, n_test, dataset, path):
+    """MOTIVATION figure: bidirectional complementarity per model pair.
+
+    For each pair we draw a stacked bar of the four outcome buckets. The two
+    middle bands — only-A-correct and only-B-correct — are the heart of the
+    routing thesis: a non-trivial only-A band means the small model BEATS the
+    LLM on a real slice of data, so the optimal policy is not "always send to
+    the LLM". (Weibo21: only-RoBERTa=220 / only-GPT=364.)
+    """
+    # pair_breakdown keys may be ("A","B") tuples; normalize to (a, b).
+    pairs = [k if isinstance(k, tuple) else tuple(k.split("|"))
+             for k in pair_breakdown.keys()]
+    raw_keys = list(pair_breakdown.keys())
+    npairs = len(pairs)
+    fig, ax = plt.subplots(figsize=(max(5, npairs * 2.4), 5))
+
+    # bucket colors: both_correct (grey), only_A (green), only_B (blue),
+    # both_wrong (red)
+    colA, colB = "#54A24B", "#4C78A8"
+    x = np.arange(npairs)
+    w = 0.6
+    for xi, (key, (a, b)) in enumerate(zip(raw_keys, pairs)):
+        bd = pair_breakdown[key]
+        both_c = bd["both_correct"]
+        only_a = bd[f"only_{a}"]
+        only_b = bd[f"only_{b}"]
+        both_w = bd["both_wrong"]
+        bottom = 0
+        segs = [
+            (both_c, "#BFBFBF", "both correct"),
+            (only_a, colA, f"only {a}"),
+            (only_b, colB, f"only {b}"),
+            (both_w, "#E45756", "both wrong"),
+        ]
+        for val, col, lab in segs:
+            ax.bar(xi, val, w, bottom=bottom, color=col,
+                   label=lab if xi == 0 else None, edgecolor="white")
+            if val > 0:
+                pct = 100.0 * val / n_test
+                ax.text(xi, bottom + val / 2, f"{val}\n({pct:.1f}%)",
+                        ha="center", va="center", fontsize=9,
+                        color="white" if col in (colA, colB, "#E45756")
+                        else "black")
+            bottom += val
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{a}\nvs\n{b}" for (a, b) in pairs], fontsize=9)
+    ax.set_ylabel(f"# test samples (n={n_test})")
+    ax.set_title(f"{dataset}: bidirectional complementarity\n"
+                 "(both middle bands non-zero ⇒ routing, not always-LLM)")
+    ax.legend(fontsize=8, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 # --------------------------------------------------------------------------- #
 # Report
 # --------------------------------------------------------------------------- #
@@ -233,48 +374,84 @@ def write_report(summary, dataset, fig_paths, path):
     lines = []
     lines.append(f"# Collaborative-Routing Diagnostic — {dataset}\n")
     lines.append(f"- Test samples (common ids): **{s['n_test']}**")
-    lines.append(f"- Models: {', '.join(s['models'])}\n")
+    lb = s["label_balance"]
+    lines.append(f"- Label balance: real(0) = {lb['n_real_0']}, "
+                 f"fake(1) = {lb['n_fake_1']} "
+                 f"(fake ratio = {lb['fake_ratio']*100:.1f}%)")
+    lines.append(f"- Models: {', '.join(s['models'])}")
+    lines.append(f"- **Primary metric: macro-F1** "
+                 f"(accuracy reported for reference)\n")
 
     lines.append("## Verdict\n")
     lines.append(f"> **{s['verdict']}**\n")
-    lines.append(f"- Best single model: **{s['best_single_model']}** "
-                 f"(acc = {s['best_single_acc']*100:.2f}%)")
-    lines.append(f"- Oracle router (any model correct): "
-                 f"**{s['full_oracle_acc']*100:.2f}%**")
-    lines.append(f"- **Routing headroom = {s['full_oracle_gain_pts']:+.2f} "
-                 f"percentage points**\n")
-    lines.append("Decision rule: ≥ 5 pts → well-founded; < 1 pt → pivot; "
-                 "1–5 pts → grey zone.\n")
+    lines.append(f"- Best single model (by macro-F1): **{s['best_single_model']}** "
+                 f"(macro-F1 = {s['best_single_f1']*100:.2f}%, "
+                 f"acc = {s['accuracy'][s['best_single_model']]*100:.2f}%)")
+    lines.append(f"- Oracle router (any model correct), macro-F1: "
+                 f"**{s['full_oracle_f1']*100:.2f}%** | "
+                 f"accuracy: {s['full_oracle_acc']*100:.2f}%")
+    lines.append(f"- **Routing headroom (macro-F1) = "
+                 f"{s['full_oracle_gain_f1_pts']:+.2f} pts** "
+                 f"(accuracy headroom = {s['full_oracle_gain_acc_pts']:+.2f} "
+                 f"pts, inflated by the majority class)\n")
+    lines.append("Decision rule (on macro-F1): ≥ 5 pts → well-founded; "
+                 "< 1 pt → pivot; 1–5 pts → grey zone.\n")
+    lines.append("> The oracle macro-F1 is computed on per-sample oracle "
+                 "predictions (gold when any model is right, flipped otherwise), "
+                 "so the *at-least-one-correct* credit is counted **per class**. "
+                 "This stops a majority-class consensus from inflating the "
+                 "headroom on imbalanced data.\n")
 
     lines.append("## Per-model performance\n")
-    lines.append("| Model | Accuracy | Macro-F1 | Test size |")
-    lines.append("|---|---|---|---|")
+    lines.append("| Model | Macro-F1 (primary) | Accuracy | acc−F1 gap | Test size |")
+    lines.append("|---|---|---|---|---|")
     for n in s["models"]:
-        lines.append(f"| {n} | {s['accuracy'][n]*100:.2f}% | "
-                     f"{s['macro_f1'][n]*100:.2f}% | {s['per_model_sizes'][n]} |")
+        gap = (s["accuracy"][n] - s["macro_f1"][n]) * 100
+        lines.append(f"| {n} | {s['macro_f1'][n]*100:.2f}% | "
+                     f"{s['accuracy'][n]*100:.2f}% | {gap:+.2f} pts | "
+                     f"{s['per_model_sizes'][n]} |")
     lines.append("")
+    lines.append("*A large positive acc−F1 gap means the model is largely "
+                 "riding the majority (real) class and is weak on the minority "
+                 "(fake) class.*\n")
 
     lines.append("## Pairwise error overlap & oracle\n")
-    lines.append("| Pair | Error Jaccard | Pair oracle acc | Pair best single | Pair gain (pts) |")
-    lines.append("|---|---|---|---|---|")
-    for key in s["pair_oracle_acc"]:
+    lines.append("| Pair | Error Jaccard | Oracle macro-F1 | Oracle acc | "
+                 "Pair best F1 | F1 gain (pts) | acc gain (pts) |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for key in s["pair_oracle_f1"]:
         j = s["pair_error_jaccard"][key]
-        o = s["pair_oracle_acc"][key]
+        of1 = s["pair_oracle_f1"][key]
+        oacc = s["pair_oracle_acc"][key]
         bd = s["pair_breakdown"][key]
-        lines.append(f"| {key} | {j:.3f} | {o*100:.2f}% | "
-                     f"{bd['pair_best_single_acc']*100:.2f}% | "
-                     f"{bd['oracle_gain_pts']:+.2f} |")
+        lines.append(f"| {key} | {j:.3f} | {of1*100:.2f}% | {oacc*100:.2f}% | "
+                     f"{bd['pair_best_single_f1']*100:.2f}% | "
+                     f"{bd['oracle_f1_gain_pts']:+.2f} | "
+                     f"{bd['oracle_acc_gain_pts']:+.2f} |")
     lines.append("")
     lines.append("*Error Jaccard = |both wrong| / |at least one wrong|. "
                  "Lower means the two models fail on different samples — exactly "
                  "the complementarity a router can exploit.*\n")
 
-    lines.append("## Where the routing gain comes from (per pair)\n")
+    lines.append("## Where the routing gain comes from — bidirectional "
+                 "complementarity\n")
+    lines.append("This is the crux of the routing argument: the thesis needs "
+                 "**both** directions to be non-empty — samples where the small "
+                 "model wins AND samples where the LLM wins. If only one band is "
+                 "populated, the optimal policy collapses to \"always use that "
+                 "model\" and there is nothing to route.\n")
+    lines.append("| Pair | both correct | only-1st correct | only-2nd correct | "
+                 "both wrong |")
+    lines.append("|---|---|---|---|---|")
     for key, bd in s["pair_breakdown"].items():
         a, b = key.split("|")
-        lines.append(f"**{a} vs {b}** (n={s['n_test']}): both correct "
-                     f"{bd['both_correct']}, only {a} {bd[f'only_{a}']}, "
-                     f"only {b} {bd[f'only_{b}']}, both wrong {bd['both_wrong']}.")
+        n = s["n_test"]
+        bc, oa, ob, bw = (bd["both_correct"], bd[f"only_{a}"],
+                          bd[f"only_{b}"], bd["both_wrong"])
+        lines.append(
+            f"| {a} vs {b} | {bc} ({bc/n*100:.1f}%) | "
+            f"only {a}: {oa} ({oa/n*100:.1f}%) | "
+            f"only {b}: {ob} ({ob/n*100:.1f}%) | {bw} ({bw/n*100:.1f}%) |")
     lines.append("")
 
     lines.append("## Figures\n")
@@ -284,11 +461,16 @@ def write_report(summary, dataset, fig_paths, path):
 
     lines.append("## How to read this\n")
     lines.append("- **World A (routing useless):** error Jaccard ≈ 1 and oracle "
-                 "gain ≈ 0 — models make the *same* mistakes.")
-    lines.append("- **World B (routing gold):** error Jaccard ≈ 0 and oracle gain "
-                 "is large — disjoint mistakes, a perfect router approaches 100%.")
-    lines.append("- The real datasets sit between these; this report locates "
-                 "exactly where, and whether the gap justifies the routing thesis.\n")
+                 "macro-F1 gain ≈ 0 — models make the *same* mistakes.")
+    lines.append("- **World B (routing gold):** error Jaccard ≈ 0 and oracle "
+                 "macro-F1 gain is large — disjoint mistakes, a perfect router "
+                 "approaches 100%.")
+    lines.append("- **Watch the acc vs macro-F1 split.** On imbalanced data "
+                 "(GossipCop) the accuracy headroom overstates the case; the "
+                 "macro-F1 headroom is the honest number and drives the verdict.")
+    lines.append("- The real datasets sit between these worlds; this report "
+                 "locates exactly where, and whether the gap justifies the "
+                 "routing thesis.\n")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -304,6 +486,9 @@ def main():
     ap.add_argument("--require", action="append", default=[],
                     help="model name(s) that MUST be present; error if missing. "
                          "By default missing prediction files are skipped.")
+    ap.add_argument("--strict-split", action="store_true",
+                    help="fail (instead of warn) if gold labels disagree across "
+                         "prediction files — guards against mixing test splits.")
     args = ap.parse_args()
 
     models = {}
@@ -335,28 +520,35 @@ def main():
     models = present
 
     os.makedirs(args.outdir, exist_ok=True)
-    (summary, names, acc, pair_jaccard, pair_oracle,
-     full_oracle, best_single_acc) = compute(models)
+    (summary, names, acc, f1, pair_jaccard, pair_oracle_acc, pair_oracle_f1,
+     pair_breakdown, full_oracle_acc, full_oracle_f1, best_single_acc,
+     best_single_f1) = compute(models, strict_split=args.strict_split)
 
     fig1 = os.path.join(args.outdir, "accuracy_vs_oracle.png")
     fig2 = os.path.join(args.outdir, "error_jaccard_heatmap.png")
-    plot_accuracy_bars(names, acc, pair_oracle, full_oracle, best_single_acc,
-                       args.dataset, fig1)
+    fig3 = os.path.join(args.outdir, "complementarity.png")
+    plot_metric_bars(names, acc, f1, pair_oracle_acc, pair_oracle_f1,
+                     full_oracle_acc, full_oracle_f1, best_single_acc,
+                     best_single_f1, args.dataset, fig1)
     plot_jaccard_heatmap(names, pair_jaccard, args.dataset, fig2)
+    plot_complementarity(pair_breakdown, summary["n_test"], args.dataset, fig3)
 
     with open(os.path.join(args.outdir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    write_report(summary, args.dataset, [fig1, fig2],
+    write_report(summary, args.dataset, [fig1, fig3, fig2],
                  os.path.join(args.outdir, "report.md"))
 
     print("\n=== DIAGNOSTIC SUMMARY ===")
-    print(f"dataset           : {args.dataset}")
-    print(f"best single model : {summary['best_single_model']} "
-          f"({best_single_acc*100:.2f}%)")
-    print(f"oracle (ALL)      : {full_oracle*100:.2f}%")
-    print(f"routing headroom  : {summary['full_oracle_gain_pts']:+.2f} pts")
-    print(f"verdict           : {summary['verdict']}")
-    print(f"outputs           : {args.outdir}/  (report.md, summary.json, *.png)")
+    print(f"dataset             : {args.dataset}")
+    print(f"primary metric      : macro-F1")
+    print(f"best single (F1)    : {summary['best_single_model']} "
+          f"({best_single_f1*100:.2f}%)")
+    print(f"oracle macro-F1     : {full_oracle_f1*100:.2f}%  "
+          f"(acc {full_oracle_acc*100:.2f}%)")
+    print(f"headroom (macro-F1) : {summary['full_oracle_gain_f1_pts']:+.2f} pts")
+    print(f"headroom (accuracy) : {summary['full_oracle_gain_acc_pts']:+.2f} pts")
+    print(f"verdict             : {summary['verdict']}")
+    print(f"outputs             : {args.outdir}/  (report.md, summary.json, *.png)")
 
 
 if __name__ == "__main__":
