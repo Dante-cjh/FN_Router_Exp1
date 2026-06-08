@@ -28,4 +28,10 @@ python -m src.step5_diagnostic \
   --dataset Weibo21 \
   --pred RoBERTa=${PRED}/weibo21_roberta.json \
   --pred GPT-5.4=${PRED}/weibo21_gpt54.json \
-  --outdir ${DIAG}
+  --outdir ${DIAG} --strict-split
+
+# --- Step B: cost-quality Pareto (routing motivation figure) -----------------
+python -m src.step6_routing \
+  --small ${PRED}/weibo21_roberta.json \
+  --large ${PRED}/weibo21_gpt54.json \
+  --name  weibo21 --out ${DIAG}

@@ -28,4 +28,10 @@ python -m src.step5_diagnostic \
   --dataset GossipCop \
   --pred RoBERTa=${PRED}/gossipcop_roberta.json \
   --pred GPT-5.4=${PRED}/gossipcop_gpt54.json \
-  --outdir ${DIAG}
+  --outdir ${DIAG} --strict-split
+
+# --- Step B: cost-quality Pareto (routing motivation figure) -----------------
+python -m src.step6_routing \
+  --small ${PRED}/gossipcop_roberta.json \
+  --large ${PRED}/gossipcop_gpt54.json \
+  --name  gossipcop --out ${DIAG}
