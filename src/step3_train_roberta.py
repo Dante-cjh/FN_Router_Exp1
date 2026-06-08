@@ -11,7 +11,11 @@ Reads the ARG-format train/val/test json (only `content`, `label`, id are
 used). Early-stops on validation macro-F1 (same selection metric as ARG),
 then dumps unified per-sample test predictions:
 
-    [{"id":..., "label": <gold 0/1>, "pred": <0/1>, "prob_fake": <float>}, ...]
+    [{"id":..., "label": <gold 0/1>, "pred": <0/1>,
+      "prob": <P(fake)>, "prob_fake": <P(fake), alias>}, ...]
+
+plus a sidecar `*_emb.npz` (arrays `ids`,`emb`,`prob`,`label`,`pred`) holding the
+penultimate-layer [CLS] embeddings — features for the Step-C learned router.
 
 Usage (on the 4090 server):
     python -m src.step3_train_roberta \
@@ -76,29 +80,44 @@ class NewsDataset:
         }
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, return_emb=False):
+    """Run the model over a loader.
+
+    When ``return_emb`` is set we also pull the penultimate-layer [CLS] / <s>
+    representation (last hidden state at token 0, 768-d) for every sample. That
+    embedding is the natural feature vector for the Step-C learned router, so we
+    persist it once here at test time instead of re-running the encoder later.
+    """
     import torch
     from sklearn.metrics import accuracy_score, f1_score
     model.eval()
-    all_logits, all_labels = [], []
+    all_logits, all_labels, all_emb = [], [], []
     with torch.no_grad():
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
             attn = batch["attention_mask"].to(device)
-            logits = model(input_ids=input_ids, attention_mask=attn).logits
-            all_logits.append(logits.detach().cpu().numpy())
+            out = model(input_ids=input_ids, attention_mask=attn,
+                        output_hidden_states=return_emb)
+            all_logits.append(out.logits.detach().cpu().numpy())
             all_labels.append(batch["labels"].numpy())
+            if return_emb:
+                # last hidden state, [CLS]/<s> token -> (B, hidden)
+                cls = out.hidden_states[-1][:, 0, :]
+                all_emb.append(cls.detach().cpu().numpy())
     logits = np.concatenate(all_logits, 0)
     labels = np.concatenate(all_labels, 0)
     probs = _softmax(logits)[:, 1]
     preds = (probs >= 0.5).astype(int)
-    return {
+    result = {
         "macro_f1": f1_score(labels, preds, average="macro"),
         "acc": accuracy_score(labels, preds),
         "preds": preds,
         "probs": probs,
         "labels": labels,
     }
+    if return_emb:
+        result["emb"] = np.concatenate(all_emb, 0)
+    return result
 
 
 def _softmax(x):
@@ -116,6 +135,10 @@ def main():
     ap.add_argument("--model_name", default=None,
                     help="HF model id; defaults per-language")
     ap.add_argument("--output", required=True, help="unified test preds json")
+    ap.add_argument("--emb_output", default=None,
+                    help="where to save penultimate-layer test embeddings "
+                         "(.npz with arrays `ids`,`emb`). Defaults to the "
+                         "--output path with `_emb.npz`. Pass 'none' to skip.")
     ap.add_argument("--ckpt_dir", default="outputs/ckpt/roberta")
     ap.add_argument("--max_len", type=int, default=170)  # matches ARG
     ap.add_argument("--batch_size", type=int, default=32)
@@ -188,14 +211,35 @@ def main():
             break
 
     model.load_state_dict(torch.load(best_path, map_location=device))
-    test = evaluate(model, te_loader, device)
+    test = evaluate(model, te_loader, device, return_emb=True)
     print(f"[step3] TEST macroF1={test['macro_f1']:.4f} acc={test['acc']:.4f}")
 
+    # `prob` == P(label=1) == P(fake); `prob_fake` kept as a backwards-compatible
+    # alias so older consumers (step5) keep working.
     out = [{"id": te_ids[i], "label": int(test["labels"][i]),
-            "pred": int(test["preds"][i]), "prob_fake": float(test["probs"][i])}
+            "pred": int(test["preds"][i]),
+            "prob": float(test["probs"][i]),
+            "prob_fake": float(test["probs"][i])}
            for i in range(len(te_ids))]
     save_json(out, args.output)
     print(f"[step3] wrote {len(out)} preds -> {args.output}")
+
+    # Persist penultimate-layer embeddings for the Step-C learned router.
+    emb_out = args.emb_output
+    if emb_out is None:
+        base, _ = os.path.splitext(args.output)
+        emb_out = base + "_emb.npz"
+    if str(emb_out).lower() != "none":
+        os.makedirs(os.path.dirname(emb_out) or ".", exist_ok=True)
+        np.savez_compressed(
+            emb_out,
+            ids=np.array(te_ids),
+            emb=test["emb"].astype(np.float32),
+            prob=test["probs"].astype(np.float32),
+            label=test["labels"].astype(np.int64),
+            pred=test["preds"].astype(np.int64),
+        )
+        print(f"[step3] wrote {test['emb'].shape} embeddings -> {emb_out}")
 
 
 if __name__ == "__main__":
