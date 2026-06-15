@@ -7,4 +7,5 @@ outputs/
 *.pt
 .DS_Store
 
-data/
+reports/
+outputs_v2/
