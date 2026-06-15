@@ -152,6 +152,11 @@ def main():
     ale_stats = band_stats(U_ale, bands)
     epi_stats = band_stats(U_epi, bands)
     tot_stats = band_stats(U_tot, bands)
+    # reducible fraction = epistemic share of total uncertainty (the headline
+    # quantity: ~0.5 on a routable regime, ~0 on an aleatoric-dominated one)
+    red_frac = {b: float(epi_stats[b]["mean"]
+                         / (epi_stats[b]["mean"] + ale_stats[b]["mean"] + 1e-12))
+                for b in bands}
 
     # ---------- (c) cash-out Pareto ----------
     all_small = macro_f1(y, sp)
@@ -188,6 +193,7 @@ def main():
         "check_b_U_ale_by_band": ale_stats,
         "U_epi_by_band": epi_stats,
         "U_tot_by_band": tot_stats,
+        "reducible_fraction_by_band": red_frac,
         "check_c_pareto": {
             "fractions": fr,
             "route_by_U_epi": pe_epi,
@@ -216,6 +222,8 @@ def main():
     print(f"  (b) mean U_ale  gain={ale_stats['only_llm_GAIN']['mean']:.4f}  "
           f"both_wrong={ale_stats['both_wrong']['mean']:.4f}  "
           f"(want both_wrong > gain)")
+    print(f"      reducible frac (U_epi share): " +
+          "  ".join(f"{b}={red_frac[b]:.3f}" for b in bands))
     print(f"  (c) all-SLM={all_small:.2f}  all-LLM={all_large:.2f}")
     for f in low_budget:
         print(f"      budget {int(f*100):>2}%  epi={at(pe_epi,f):.2f}  "

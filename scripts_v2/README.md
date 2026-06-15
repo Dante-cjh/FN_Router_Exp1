@@ -24,3 +24,31 @@ bash scripts_v2/run_uncertainty_en.sh     # GossipCop
 - **(c) 兑现**：`U_epi` 门控路由（`epi>ale` 无参数门）在低预算（5/10/20%）是否仍 ≥ all-SLM。
 
 > 预判：Weibo21 大概率三项通过；GossipCop 的 (c) 可能仍过不了（LLM 是弱腿）——若如此，这本身是论文要的正面结论（可约性信号更优，但仍需 regime gate 才能转盈利），不是失败。
+
+## 实验 A — 校准（dropout 放大 + 温度缩放）
+
+夯实 reports/05 的头号结论（可约比例）。先 fit 温度、再用 3 个配置（p0.3 / temp / 两者）重算不确定性与诊断，最后并排对比 reducible-fraction。
+
+```bash
+bash scripts_v2/run_calibration_zh.sh      # Weibo21
+bash scripts_v2/run_calibration_en.sh      # GossipCop
+#   T=50 DP=0.5 bash scripts_v2/run_calibration_en.sh   # 调参
+```
+
+- `src_v2/fit_temperature.py` — val 上 fit T*（Guo et al.），报告 ECE/NLL before/after，写 `outputs_v2/calibration/<ds>_temperature.json`。
+- `src_v2/mc_dropout_uncertainty.py` 新增 `--dropout_p`（推理 dropout 覆盖）/`--temperature`（logits 缩放）/`--tag`（输出区分）。
+- `src_v2/compare_calibration.py` — 并排打印各配置的 reducible-fraction 与 check-(a) AUC。读法：若 GossipCop 的 GAIN 带 reducible-frac 跨配置仍很小、Weibo21 仍≈0.5，则头号结论对校准稳健。
+
+## 实验 B — 主方法（净效用双头 + regime gate）
+
+```bash
+bash scripts_v2/run_uncertainty_zh.sh   # 若还没跑过 pilot，先有 base 不确定性
+bash scripts_v2/run_router_zh.sh        # Weibo21 主方法
+bash scripts_v2/run_router_en.sh        # GossipCop 主方法
+#   用 A 的校准版不确定性： UNC_TAG=__temp bash scripts_v2/run_router_en.sh
+#   ablation（去掉 U_epi/U_ale）： 在脚本里给 net_utility_router 加 --drop_uncertainty
+```
+
+`src_v2/net_utility_router.py` — 双头(p_gain/p_harm) + 类加权净效用 `u(x)` + 预算上界(`u>0`) + 数据集级 gate（`--gate off|ci|sign`，默认 off，详见 `reports/05b`）。输出 `outputs_v2/router/<ds>/net_utility.json` + Pareto 图。
+
+> 干跑预览（base 不确定性）：本方法两个数据集都 dominate v1 且不亏（Weibo21 峰值 86.62>v1 86.25；GossipCop 76.7 不再跌破 76.37）。详见 `reports/05b_round2_method_dryrun.md`，含一个重要发现：Weibo21 时间切分导致 val→test 漂移、数据集级硬 gate 会误关闸——故默认依赖 per-sample `u>0`。

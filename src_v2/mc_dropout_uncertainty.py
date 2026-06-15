@@ -56,16 +56,22 @@ def _softmax_t(logits):
     return torch.softmax(logits, dim=-1).detach().cpu().numpy()
 
 
-def enable_mc_dropout(model):
+def enable_mc_dropout(model, dropout_p=None):
     """Put the model in eval mode but RE-ENABLE every Dropout layer.
 
     RoBERTa uses LayerNorm (deterministic), so the only stochasticity left is the
     dropout layers — this is the standard MC-Dropout recipe.
+
+    If ``dropout_p`` is given, every Dropout layer's rate is OVERRIDDEN to that
+    value (calibration experiment A1: amplify inference dropout to fight the
+    epistemic-uncertainty collapse of an over-confident fine-tuned model).
     """
     model.eval()
     n = 0
     for m in model.modules():
         if m.__class__.__name__.startswith("Dropout"):
+            if dropout_p is not None:
+                m.p = float(dropout_p)
             m.train()
             n += 1
     return n
@@ -77,11 +83,17 @@ def entropy_rows(p, eps=1e-12):
     return -(p * np.log(p)).sum(axis=-1)
 
 
-def mc_forward(model, loader, device, T):
-    """Return per-pass class probabilities, shape (T, N, 2)."""
+def mc_forward(model, loader, device, T, temperature=1.0, dropout_p=None):
+    """Return per-pass class probabilities, shape (T, N, 2).
+
+    ``temperature`` (calibration experiment A2) divides the logits before the
+    softmax so two differently-calibrated backbones can be put on the same scale
+    before the U_ale / U_epi magnitudes are compared across datasets.
+    """
     import torch
-    n_drop = enable_mc_dropout(model)
-    print(f"[mc] enabled {n_drop} dropout layers; running T={T} passes")
+    n_drop = enable_mc_dropout(model, dropout_p)
+    print(f"[mc] enabled {n_drop} dropout layers (p_override={dropout_p}); "
+          f"T={T} temperature={temperature}")
     passes = []
     with torch.no_grad():
         for t in range(T):
@@ -90,7 +102,7 @@ def mc_forward(model, loader, device, T):
                 input_ids = batch["input_ids"].to(device)
                 attn = batch["attention_mask"].to(device)
                 logits = model(input_ids=input_ids, attention_mask=attn).logits
-                probs_t.append(_softmax_t(logits))
+                probs_t.append(_softmax_t(logits / temperature))
             passes.append(np.concatenate(probs_t, 0))
             if (t + 1) % 5 == 0 or t == T - 1:
                 print(f"[mc]   pass {t + 1}/{T}")
@@ -107,6 +119,13 @@ def main():
     ap.add_argument("--split", required=True, choices=["val", "test"])
     ap.add_argument("--out", default="outputs_v2/uncertainty", help="output dir")
     ap.add_argument("--T", type=int, default=30, help="number of MC-Dropout passes")
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="divide logits by this before softmax (A2 calibration)")
+    ap.add_argument("--dropout_p", type=float, default=None,
+                    help="override every Dropout rate at inference (A1 calibration)")
+    ap.add_argument("--tag", default="",
+                    help="suffix added to output filename to keep configs separate, "
+                         "e.g. p0.3 / temp / p0.3_temp")
     ap.add_argument("--max_len", type=int, default=170)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--seed", type=int, default=3759)
@@ -132,7 +151,9 @@ def main():
     loader = DataLoader(NewsDataset(x, y, tok, args.max_len),
                         batch_size=args.batch_size)
 
-    probs = mc_forward(model, loader, device, args.T)          # (T, N, 2)
+    probs = mc_forward(model, loader, device, args.T,
+                       temperature=args.temperature,
+                       dropout_p=args.dropout_p)               # (T, N, 2)
     p_bar = probs.mean(0)                                       # (N, 2)
     U_tot = entropy_rows(p_bar)                                 # (N,)
     U_ale = entropy_rows(probs).mean(0)                         # (N,) mean over T
@@ -160,12 +181,15 @@ def main():
         "U_ale": float(U_ale[i]),
         "U_epi": float(U_epi[i]),
     } for i in range(len(ids))]
-    out_json = os.path.join(odir, f"{args.name}_{args.split}.json")
+    suffix = f"__{args.tag}" if args.tag else ""
+    out_json = os.path.join(odir, f"{args.name}_{args.split}{suffix}.json")
     save_json(rows, out_json)
     np.savez_compressed(
-        os.path.join(odir, f"{args.name}_{args.split}.npz"),
+        os.path.join(odir, f"{args.name}_{args.split}{suffix}.npz"),
         ids=np.array(ids), label=y, pred_mc=pred_mc, prob_mc=prob_mc,
         U_tot=U_tot, U_ale=U_ale, U_epi=U_epi, T=args.T,
+        temperature=args.temperature,
+        dropout_p=(args.dropout_p if args.dropout_p is not None else -1.0),
     )
     print(f"[mc] wrote {len(rows)} rows -> {out_json} (+ .npz)")
 
