@@ -83,3 +83,50 @@ For **GossipCop (en)** replace `weibo21_` → `gossipcop_` and
 
 All commands run from the `Router_Exp1/` root (the `-m` module form needs it).
 Outputs land in `outputs/diagnostic/<name>/baselines/routing_*.json`.
+
+## Diagnostics & comparison plot
+
+### `diagnose_slm_floor.py` — why M&S's `h` jumps on weibo21
+
+The first run showed the M&S classifier `h` at 89.92 vs frozen RoBERTa 76.30 on
+weibo21 (but ~equal on gossipcop). This is **not a storage bug** (json `pred` and
+npz `emb`/`pred` are byte-identical, same forward pass). It is **train→test
+distribution shift**: refitting a linear head on the *val* emb recovers ~88 on
+weibo21 test from the same embeddings the frozen head scores 76 on, while on
+gossipcop a val-refit head is slightly *worse*. So any method that refits a head
+on val (M&S's `h`) gets that gain for free — not a deferral gain.
+
+```bash
+cd Router_Exp1
+python -m baselines.diagnose_slm_floor
+```
+
+### `l2d_router.py --slm_floor` (re-run M&S after the fix)
+
+To keep M&S comparable to the front-door routers, the M&S script now reports its
+curve on the **frozen RoBERTa floor by default** (`--slm_floor frozen`), isolating
+the deferral contribution; the `h`-floor curve is still saved for reference.
+**Re-run the M&S baseline** so the new `router_f1` (frozen floor) + extra keys are
+written (Hybrid LLM and RouteLLM are unchanged, no need to re-run them):
+
+```bash
+python -m baselines.mozannar_sontag.l2d_router \
+  --small_val outputs/preds/weibo21_roberta_val.json --large_val outputs/preds/weibo21_gpt54_val.json \
+  --small_test outputs/preds/weibo21_roberta.json    --large_test outputs/preds/weibo21_gpt54.json \
+  --name weibo21 --out outputs/diagnostic/weibo21/baselines           # add --slm_floor h to see the faithful curve
+```
+
+### `plot_comparison.py` — one Pareto figure + summary table per dataset
+
+Overlays Oracle / Random / Chow (step6) + **Ours = step7 learned** + the three
+baselines, and writes a markdown/CSV summary of peak / APGR / budget points.
+Missing curves are skipped with a warning, so it runs even if some baselines
+aren't generated yet.
+
+```bash
+cd Router_Exp1
+python -m baselines.plot_comparison --datasets weibo21 gossipcop \
+  --diag_root outputs/diagnostic \
+  --out_dir   outputs/diagnostic/baseline_comparison
+# -> baseline_comparison/{weibo21,gossipcop}_pareto.png, comparison_all.png, summary.{md,csv}
+```

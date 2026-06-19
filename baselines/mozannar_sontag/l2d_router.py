@@ -104,6 +104,12 @@ def main():
     ap.add_argument("--alpha", type=float, default=1.0,
                     help="keep at 1.0 for the consistent naive estimator; "
                          "any other value is a non-consistent variant.")
+    ap.add_argument("--slm_floor", choices=["frozen", "h"], default="frozen",
+                    help="non-deferred prediction used for the PRIMARY curve. "
+                         "'frozen' (default) = frozen RoBERTa pred -> comparable "
+                         "to Hybrid LLM/RouteLLM/step7 (isolates deferral). "
+                         "'h' = jointly-learned classifier -> method-faithful but "
+                         "folds in the val head-refit gain. Both are saved.")
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--points", type=int, default=21)
@@ -139,34 +145,59 @@ def main():
     h_pred = class_logits.argmax(1)                 # L2D classifier prediction
     defer_margin = g[:, K] - class_logits.max(1)    # g_⊥ - max_y g_y
 
-    # most defer-worthy first; non-deferred prediction = h(x), deferred = LLM
+    # most defer-worthy first (defer = route to LLM)
     order = np.argsort(-defer_margin)
-    fr, curve = curve_from_order(order, yte, h_pred, lpte, args.points)
+
+    # TWO curves on the SAME defer ordering:
+    #   h-floor      : non-deferred prediction = the jointly-learned h(x).
+    #                  Faithful to the (h, r) system, but folds in the gain from
+    #                  REFITTING a head on val (see diagnose_slm_floor.py): on
+    #                  weibo21 that head jumps 76->~88 purely from train/test
+    #                  shift, which is NOT a deferral gain.
+    #   frozen-floor : non-deferred prediction = the frozen RoBERTa pred (sp),
+    #                  exactly the floor Hybrid LLM / RouteLLM / step7 use. This
+    #                  ISOLATES the deferral contribution and is the apples-to-
+    #                  apples curve for the comparison plot.
+    fr, curve_h = curve_from_order(order, yte, h_pred, lpte, args.points)
+    _,  curve_fz = curve_from_order(order, yte, spte, lpte, args.points)
 
     # endpoints / reference numbers
-    f1_h = macro_f1(yte, h_pred)            # all-non-defer (== 0% routed)
+    f1_h = macro_f1(yte, h_pred)            # h at 0% routed (h-floor endpoint)
     f1_large = macro_f1(yte, lpte)
-    f1_slm = macro_f1(yte, spte)           # standalone RoBERTa, for reference
+    f1_slm = macro_f1(yte, spte)           # frozen RoBERTa (frozen-floor endpoint)
     naive_defer = defer_margin >= 0        # tau = 0 naive deferrer
     naive_pred = h_pred.copy(); naive_pred[naive_defer] = lpte[naive_defer]
     f1_naive = macro_f1(yte, naive_pred)
     naive_frac = float(naive_defer.mean())
 
-    tag = (f"Mozannar-Sontag naive L_CE (alpha={args.alpha}) "
+    primary = curve_fz if args.slm_floor == "frozen" else curve_h
+    floor_f1 = f1_slm if args.slm_floor == "frozen" else f1_h
+
+    tag = (f"Mozannar-Sontag naive L_CE (alpha={args.alpha}, floor={args.slm_floor}) "
            f"feats={'emb+scalar' if he2 else 'scalar-only'}")
-    a = report_budget_points(fr, curve, f1_h, f1_large, args.name, tag)
-    print(f"  L2D classifier h macro-F1 (0%% routed) = {f1_h:.2f}  "
-          f"(standalone RoBERTa = {f1_slm:.2f})")
+    a = report_budget_points(fr, primary, floor_f1, f1_large, args.name, tag)
+    print(f"  L2D classifier h macro-F1 = {f1_h:.2f}   "
+          f"frozen RoBERTa = {f1_slm:.2f}  "
+          f"(gap {f1_h-f1_slm:+.2f} = val head-refit, NOT deferral; "
+          f"see diagnose_slm_floor.py)")
     print(f"  naive argmax deferrer (tau=0): defers {naive_frac*100:.0f}%% -> "
-          f"macro-F1 {f1_naive:.2f}")
+          f"macro-F1 (h-floor) {f1_naive:.2f}")
+    print(f"  curves: frozen-floor peak={max(curve_fz):.2f}  "
+          f"h-floor peak={max(curve_h):.2f}  (primary = {args.slm_floor})")
 
     p = write_curve(args.out, "routing_mozannar_sontag.json", {
         "method": "MozannarSontag/naive_LCE", "name": args.name,
-        "alpha": args.alpha, "n": int(len(yte)), "fractions": fr.tolist(),
-        "all_small_f1": f1_h,                 # == h at 0% routed (curve endpoint)
-        "standalone_roberta_f1": f1_slm,
+        "alpha": args.alpha, "slm_floor": args.slm_floor,
+        "n": int(len(yte)), "fractions": fr.tolist(),
+        # `all_small_f1`/`router_f1` follow the chosen floor so the comparison
+        # plot picks up the comparable (frozen) curve by default.
+        "all_small_f1": floor_f1,
+        "router_f1": primary.tolist(), "apgr": a,
         "all_large_f1": f1_large,
-        "router_f1": curve.tolist(), "apgr": a,
+        # both curves + both floors kept for transparency / ablation:
+        "router_f1_frozen_floor": curve_fz.tolist(),
+        "router_f1_h_floor": curve_h.tolist(),
+        "frozen_roberta_f1": f1_slm, "h_classifier_f1": f1_h,
         "naive_defer_fraction": naive_frac, "naive_defer_f1": f1_naive,
         "feats": "emb+scalar" if he2 else "scalar-only",
     })
