@@ -1,0 +1,86 @@
+{
+  "name": "weibo21",
+  "features": "dict",
+  "scope": "disagree",
+  "model": "logreg",
+  "transfer_from": null,
+  "n_disagree_train": 530,
+  "n_disagree_test": 559,
+  "arb_auc_test_disagree": 0.5405103015418201,
+  "tau_valF1": 0.498423,
+  "val_full_arb_f1": 81.47,
+  "endpoints": {
+    "all_slm": 76.3,
+    "all_llm": 82.97
+  },
+  "full_arbitration_f1": 80.43,
+  "adopt_rate_test": 0.556350626118068,
+  "delta_vs_all_slm": {
+    "mean": 4.140216005569166,
+    "lo": 2.391768358658003,
+    "hi": 5.856704172609464
+  },
+  "delta_vs_all_llm": {
+    "mean": -2.5112856630958573,
+    "lo": -4.236046624294511,
+    "hi": -0.9456489554157239
+  },
+  "crc_sweep": [
+    {
+      "alpha": 0.05,
+      "tau": 0.6275490215056123,
+      "val_adopt_rate": 0.14528301886792452,
+      "test_adopt_rate": 0.2808586762075134,
+      "test_realized_risk": 0.1001788908765653,
+      "full_arb_f1": 78.23
+    },
+    {
+      "alpha": 0.1,
+      "tau": 0.6086774490961802,
+      "val_adopt_rate": 0.2811320754716981,
+      "test_adopt_rate": 0.4221824686940966,
+      "test_realized_risk": 0.148479427549195,
+      "full_arb_f1": 79.24
+    },
+    {
+      "alpha": 0.15,
+      "tau": 0.5910226784320819,
+      "val_adopt_rate": 0.39245283018867927,
+      "test_adopt_rate": 0.4919499105545617,
+      "test_realized_risk": 0.16994633273703041,
+      "full_arb_f1": 79.88
+    },
+    {
+      "alpha": 0.2,
+      "tau": 0.4844343936851319,
+      "val_adopt_rate": 0.5,
+      "test_adopt_rate": 0.5957066189624329,
+      "test_realized_risk": 0.2110912343470483,
+      "full_arb_f1": 80.64
+    },
+    {
+      "alpha": 0.3,
+      "tau": 0.45733810616066556,
+      "val_adopt_rate": 0.6886792452830188,
+      "test_adopt_rate": 0.6958855098389982,
+      "test_realized_risk": 0.2522361359570662,
+      "full_arb_f1": 81.4
+    },
+    {
+      "alpha": 0.4,
+      "tau": 0.3405787035712269,
+      "val_adopt_rate": 0.8547169811320755,
+      "test_adopt_rate": 0.8658318425760286,
+      "test_realized_risk": 0.31305903398926654,
+      "full_arb_f1": 82.64
+    },
+    {
+      "alpha": 0.5,
+      "tau": 0.16393795752247803,
+      "val_adopt_rate": 0.9830188679245283,
+      "test_adopt_rate": 0.9892665474060823,
+      "test_realized_risk": 0.3685152057245081,
+      "full_arb_f1": 83.06
+    }
+  ]
+}
